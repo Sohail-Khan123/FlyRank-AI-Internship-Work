@@ -1,5 +1,5 @@
 """
-Task API — a small in-memory CRUD API built with FastAPI.
+Task API — a small CRUD API backed by SQLite.
 
 Run with:
     uvicorn main:app --reload --port 8000
@@ -10,8 +10,11 @@ Then visit:
     http://localhost:8000/docs      -> Swagger UI (interactive docs)
 """
 
-from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Request, status
+import sqlite3
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -19,13 +22,11 @@ from pydantic import BaseModel, Field
 app = FastAPI(
     title="Task API",
     version="1.0",
-    description="A small in-memory CRUD API for managing a to-do list.",
+    description="A small SQLite-backed CRUD API for managing a to-do list.",
 )
 
+DB_PATH = Path(__file__).parent / "tasks.db"
 
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
 
 class Task(BaseModel):
     id: int
@@ -44,24 +45,41 @@ class TaskUpdate(BaseModel):
     done: Optional[bool] = Field(None, description="New done state")
 
 
-# ---------------------------------------------------------------------------
-# In-memory "database"
-# ---------------------------------------------------------------------------
-
-def seed_tasks() -> List[dict]:
-    return [
-        {"id": 1, "title": "Buy milk", "done": False},
-        {"id": 2, "title": "Write report", "done": False},
-        {"id": 3, "title": "Walk the dog", "done": True},
-    ]
+def get_connection() -> sqlite3.Connection:
+    """Open a connection to tasks.db and return a row-aware connection."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
-tasks: List[dict] = seed_tasks()
-next_id: int = 4
+def init_db() -> None:
+    """Create the tasks table if needed and seed 3 example tasks only when empty."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT    NOT NULL,
+                done  BOOLEAN NOT NULL DEFAULT 0
+            )
+            """
+        )
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        if count == 0:
+            conn.executemany(
+                "INSERT INTO tasks (title, done) VALUES (?, ?)",
+                [
+                    ("Buy milk", 0),
+                    ("Write report", 0),
+                    ("Walk the dog", 1),
+                ],
+            )
+        conn.commit()
 
 
-def find_task(task_id: int) -> Optional[dict]:
-    return next((t for t in tasks if t["id"] == task_id), None)
+def row_to_task(row: sqlite3.Row) -> dict:
+    return {"id": row["id"], "title": row["title"], "done": bool(row["done"]) }
 
 
 def error(message: str) -> dict:
@@ -82,9 +100,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-# ---------------------------------------------------------------------------
-# Root & health
-# ---------------------------------------------------------------------------
+init_db()
+
 
 @app.get("/", summary="API description")
 def root():
@@ -102,31 +119,26 @@ def health():
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Read
-# ---------------------------------------------------------------------------
-
 @app.get("/tasks", summary="List all tasks", response_model=List[Task])
 def list_tasks():
-    """Return the full list of tasks."""
-    return tasks
+    """Return all tasks from the SQLite database."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM tasks").fetchall()
+    return [row_to_task(r) for r in rows]
 
 
 @app.get("/tasks/{task_id}", summary="Get a single task", response_model=Task)
 def get_task(task_id: int):
     """Return one task by id, or 404 if it doesn't exist."""
-    task = find_task(task_id)
-    if task is None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content=error(f"Task {task_id} not found"),
         )
-    return task
+    return row_to_task(row)
 
-
-# ---------------------------------------------------------------------------
-# Create
-# ---------------------------------------------------------------------------
 
 @app.post(
     "/tasks",
@@ -135,69 +147,76 @@ def get_task(task_id: int):
     response_model=Task,
 )
 def create_task(payload: TaskCreate):
-    """Create a task. Title must be present and non-empty, or 400 is returned."""
-    global next_id
-
+    """Insert a task into SQLite. Title must be present and non-empty, or 400 is returned."""
     title = (payload.title or "").strip()
     if not title:
-        raise HTTPException(status_code=400, detail="Title is required and cannot be empty")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=error("Title is required and cannot be empty"),
+        )
 
-    task = {"id": next_id, "title": title, "done": False}
-    tasks.append(task)
-    next_id += 1
-    return task
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO tasks (title, done) VALUES (?, ?)",
+            (title, 0),
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (new_id,)).fetchone()
 
+    return row_to_task(row)
 
-# ---------------------------------------------------------------------------
-# Update
-# ---------------------------------------------------------------------------
 
 @app.put("/tasks/{task_id}", summary="Update a task", response_model=Task)
 def update_task(task_id: int, payload: TaskUpdate):
     """
-    Replace a task's title and/or done state.
-    Unknown id -> 404. Empty/invalid body (neither field given, or blank title) -> 400.
+    Update a task's title and/or done state in the database.
+    Unknown id -> 404. Empty/invalid body -> 400.
     """
-    task = find_task(task_id)
-    if task is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=error(f"Task {task_id} not found"),
-        )
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=error(f"Task {task_id} not found"),
+            )
 
-    if payload.title is None and payload.done is None:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=error("Provide at least one of: title, done"),
-        )
-
-    if payload.title is not None:
-        title = payload.title.strip()
-        if not title:
+        if payload.title is None and payload.done is None:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content=error("Title cannot be empty"),
+                content=error("Provide at least one of: title, done"),
             )
-        task["title"] = title
 
-    if payload.done is not None:
-        task["done"] = payload.done
+        new_title = row["title"]
+        if payload.title is not None:
+            new_title = payload.title.strip()
+            if not new_title:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=error("Title cannot be empty"),
+                )
 
-    return task
+        new_done = row["done"] if payload.done is None else int(payload.done)
+        conn.execute(
+            "UPDATE tasks SET title = ?, done = ? WHERE id = ?",
+            (new_title, new_done, task_id),
+        )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
 
+    return row_to_task(updated)
 
-# ---------------------------------------------------------------------------
-# Delete
-# ---------------------------------------------------------------------------
 
 @app.delete("/tasks/{task_id}", summary="Delete a task", status_code=status.HTTP_204_NO_CONTENT)
 def delete_task(task_id: int):
-    """Remove a task by id. Unknown id -> 404."""
-    task = find_task(task_id)
-    if task is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=error(f"Task {task_id} not found"),
-        )
-    tasks.remove(task)
+    """Remove a task row by id via SQL DELETE. Unknown id -> 404."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=error(f"Task {task_id} not found"),
+            )
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
     return None
